@@ -17,7 +17,7 @@ POLL_SECONDS = 2
 
 
 # =========================
-# HELPERS
+# HTTP HEADERS
 # =========================
 def headers_json():
     return {
@@ -38,6 +38,9 @@ def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# =========================
+# SUPABASE REST HELPERS
+# =========================
 def rest_get(table: str, params: dict):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     r = requests.get(url, headers=headers_json(), params=params, timeout=45)
@@ -53,6 +56,9 @@ def rest_patch(table: str, where_params: dict, payload: dict):
         raise RuntimeError(f"REST PATCH {table} failed {r.status_code}: {r.text}")
 
 
+# =========================
+# JOB PICKING
+# =========================
 def pick_job():
     # Pick 1 queued job not locked
     rows = rest_get(
@@ -97,16 +103,19 @@ def get_file(file_id: str):
 
 def normalize_storage_path(p: str) -> str:
     """
-    Worker expects relative object path inside bucket.
+    Worker expects a RELATIVE object path inside the bucket.
     If someone stored 'hdr_raw/uuid/file.jpg' by mistake, strip leading 'hdr_raw/'.
     If someone stored '/hdr_raw/...' strip leading slash too.
     """
-    p = p.strip().lstrip("/")
+    p = (p or "").strip().lstrip("/")
     if p.startswith(f"{RAW_BUCKET}/"):
         p = p[len(f"{RAW_BUCKET}/") :]
     return p
 
 
+# =========================
+# STORAGE (DOWNLOAD/UPLOAD)
+# =========================
 def storage_download(bucket: str, rel_path: str):
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{rel_path}"
     r = requests.get(url, headers=headers_storage(), timeout=90)
@@ -140,28 +149,46 @@ def storage_upload_jpg(bucket: str, rel_path: str, bgr_img, quality: int = 92):
         raise RuntimeError(f"UPLOAD failed {r.status_code} for {bucket}/{rel_path}: {r.text}")
 
 
+# =========================
+# HDR FUSION (SAFE)
+# =========================
 def exposure_fusion(imgs_bgr):
     """
-    Natural HDR (real-estate look) using OpenCV Mertens exposure fusion.
+    Natural HDR using Mertens exposure fusion.
+    SAFETY:
+    - Resize all images to same size
+    - Try/except so worker never crashes
+    - Fallback to base exposure if fusion fails
     """
-    mertens = cv2.createMergeMertens(1.0, 1.0, 1.0)
-    imgs_f = [i.astype(np.float32) / 255.0 for i in imgs_bgr]
-    fused = mertens.process(imgs_f)
-    out = np.clip(fused * 255.0, 0, 255).astype(np.uint8)
-    return out
+    try:
+        if not imgs_bgr or len(imgs_bgr) < 3:
+            raise RuntimeError("Need 3 images for HDR fusion")
+
+        # Ensure same size to prevent OpenCV crash
+        h, w = imgs_bgr[0].shape[:2]
+        resized = [cv2.resize(img, (w, h)) for img in imgs_bgr]
+
+        mertens = cv2.createMergeMertens()
+        imgs_f = [img.astype(np.float32) / 255.0 for img in resized]
+        fused = mertens.process(imgs_f)
+
+        out = np.clip(fused * 255.0, 0, 255).astype(np.uint8)
+        return out
+
+    except Exception as e:
+        print("FUSION ERROR:", str(e))
+        # fallback: return middle exposure (base)
+        return imgs_bgr[1] if imgs_bgr and len(imgs_bgr) > 1 else imgs_bgr[0]
 
 
 def order_done(order_id: str) -> bool:
-    rows = rest_get(
-        "hdr_sets",
-        {"select": "status", "order_id": f"eq.{order_id}"},
-    )
+    rows = rest_get("hdr_sets", {"select": "status", "order_id": f"eq.{order_id}"})
     statuses = [r["status"] for r in rows]
     return bool(statuses) and all(s == "complete" for s in statuses)
 
 
 # =========================
-# MAIN WORK
+# PROCESS ONE JOB
 # =========================
 def process_once():
     print("Worker alive: checking for jobs...")
@@ -178,7 +205,11 @@ def process_once():
 
     try:
         # Lock job
-        rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "processing", "locked_at": now_iso(), "attempts": attempts + 1})
+        rest_patch(
+            "hdr_jobs",
+            {"id": f"eq.{job_id}"},
+            {"status": "processing", "locked_at": now_iso(), "attempts": attempts + 1},
+        )
 
         s = get_set(set_id)
         order_id = s["order_id"]
@@ -187,27 +218,31 @@ def process_once():
         rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "processing"})
         rest_patch("hdr_orders", {"id": f"eq.{order_id}"}, {"status": "processing"})
 
+        # Load file records
         f_under = get_file(s["file_under_id"])
-        f_base  = get_file(s["file_base_id"])
-        f_over  = get_file(s["file_over_id"])
+        f_base = get_file(s["file_base_id"])
+        f_over = get_file(s["file_over_id"])
 
+        # Normalize storage paths
         p_under = normalize_storage_path(f_under["storage_path"])
-        p_base  = normalize_storage_path(f_base["storage_path"])
-        p_over  = normalize_storage_path(f_over["storage_path"])
+        p_base = normalize_storage_path(f_base["storage_path"])
+        p_over = normalize_storage_path(f_over["storage_path"])
 
         print("Paths:", p_under, p_base, p_over)
 
+        # Download images
         imgs = [
             storage_download(RAW_BUCKET, p_under),
             storage_download(RAW_BUCKET, p_base),
             storage_download(RAW_BUCKET, p_over),
         ]
 
+        # HDR fusion
         out = exposure_fusion(imgs)
 
+        # Upload output
         out_path = f"{order_id}/{set_id}.jpg"
         print("Uploading output:", out_path)
-
         storage_upload_jpg(OUT_BUCKET, out_path, out)
 
         # Mark complete
@@ -235,6 +270,9 @@ def process_once():
         return True
 
 
+# =========================
+# LOOP
+# =========================
 def main():
     print("HDR Worker started.")
     while True:
