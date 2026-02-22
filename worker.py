@@ -12,7 +12,6 @@ SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 RAW_BUCKET = "hdr_raw"
 OUT_BUCKET = "hdr_output"
-
 POLL_SECONDS = 2
 
 
@@ -57,7 +56,7 @@ def rest_patch(table: str, where_params: dict, payload: dict):
 
 
 # =========================
-# JOB PICKER
+# DB HELPERS
 # =========================
 def pick_job():
     rows = rest_get(
@@ -100,10 +99,11 @@ def get_file(file_id: str):
     return rows[0]
 
 
-def normalize_storage_path(path: str):
+def normalize_storage_path(bucket: str, path: str):
     path = (path or "").lstrip("/")
-    if path.startswith(f"{RAW_BUCKET}/"):
-        path = path[len(RAW_BUCKET) + 1 :]
+    # if someone accidentally stored "hdr_raw/uuid/file.jpg", strip "hdr_raw/"
+    if path.startswith(f"{bucket}/"):
+        path = path[len(bucket) + 1 :]
     return path
 
 
@@ -111,11 +111,12 @@ def normalize_storage_path(path: str):
 # STORAGE
 # =========================
 def storage_download(bucket: str, rel_path: str):
-    rel_path = normalize_storage_path(rel_path)
+    rel_path = normalize_storage_path(bucket, rel_path)
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{rel_path}"
-    print("Downloading:", rel_path)
 
-    r = requests.get(url, headers=headers_storage(), timeout=120)
+    print("Downloading:", f"{bucket}/{rel_path}")
+
+    r = requests.get(url, headers=headers_storage(), timeout=180)
     if r.status_code != 200:
         raise RuntimeError(f"Download failed {r.status_code}: {r.text}")
 
@@ -123,6 +124,13 @@ def storage_download(bucket: str, rel_path: str):
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError("Image decode failed")
+
+    # 🔥 IMMEDIATE DOWNSCALE right after decode (saves RAM)
+    h, w = img.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > 1500:
+        scale = 1500 / max_dim
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
     return img
 
@@ -134,6 +142,8 @@ def storage_upload(bucket: str, rel_path: str, img_bgr):
 
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{rel_path}"
 
+    print("Uploading:", f"{bucket}/{rel_path}")
+
     r = requests.post(
         url,
         headers={
@@ -142,7 +152,7 @@ def storage_upload(bucket: str, rel_path: str, img_bgr):
             "x-upsert": "true",
         },
         data=enc.tobytes(),
-        timeout=120,
+        timeout=180,
     )
 
     if r.status_code // 100 != 2:
@@ -150,43 +160,36 @@ def storage_upload(bucket: str, rel_path: str, img_bgr):
 
 
 # =========================
-# SAFE HDR FUSION
+# ULTRA SAFE HDR FUSION
 # =========================
 def exposure_fusion(imgs_bgr):
     try:
-        if not imgs_bgr or len(imgs_bgr) < 3:
-            raise RuntimeError("Need 3 images")
-
-        resized = []
-
-        for img in imgs_bgr:
-            h, w = img.shape[:2]
-
-            # 🔥 Downscale if larger than 2000px
-            max_dim = max(w, h)
-            if max_dim > 2000:
-                scale = 2000 / max_dim
-                img = cv2.resize(img, (int(w * scale), int(h * scale)))
-
-            resized.append(img)
+        if len(imgs_bgr) < 3:
+            return imgs_bgr[1]
 
         # Ensure same size
-        h, w = resized[0].shape[:2]
-        resized = [cv2.resize(img, (w, h)) for img in resized]
+        h, w = imgs_bgr[0].shape[:2]
+        imgs = [cv2.resize(img, (w, h)) for img in imgs_bgr]
+
+        # Convert one-by-one to keep memory lower
+        imgs_float = []
+        for img in imgs:
+            imgs_float.append(img.astype(np.float32) / 255.0)
 
         mertens = cv2.createMergeMertens()
-
-        imgs_float = [img.astype(np.float32) / 255.0 for img in resized]
-
         fused = mertens.process(imgs_float)
 
-        out = np.clip(fused * 255.0, 0, 255).astype(np.uint8)
+        out = (fused * 255.0).clip(0, 255).astype(np.uint8)
+
+        # free memory
+        del imgs_float
+        del fused
+        del imgs
 
         return out
 
     except Exception as e:
         print("FUSION ERROR:", str(e))
-        # fallback to base exposure
         return imgs_bgr[1]
 
 
@@ -212,7 +215,7 @@ def process_once():
     set_id = job["set_id"]
     attempts = job.get("attempts", 0)
 
-    print("Picked job", job_id)
+    print(f"Picked job {job_id} set_id={set_id} attempts={attempts}")
 
     try:
         rest_patch(
@@ -231,20 +234,25 @@ def process_once():
         f_base = get_file(s["file_base_id"])
         f_over = get_file(s["file_over_id"])
 
-        imgs = [
-            storage_download(RAW_BUCKET, f_under["storage_path"]),
-            storage_download(RAW_BUCKET, f_base["storage_path"]),
-            storage_download(RAW_BUCKET, f_over["storage_path"]),
-        ]
+        print("Paths:",
+              f_under["storage_path"],
+              f_base["storage_path"],
+              f_over["storage_path"])
 
-        out = exposure_fusion(imgs)
+        # DOWNLOAD
+        img_under = storage_download(RAW_BUCKET, f_under["storage_path"])
+        img_base = storage_download(RAW_BUCKET, f_base["storage_path"])
+        img_over = storage_download(RAW_BUCKET, f_over["storage_path"])
+
+        # FUSION
+        out = exposure_fusion([img_under, img_base, img_over])
 
         out_path = f"{order_id}/{set_id}.jpg"
 
-        print("Uploading:", out_path)
-
+        # UPLOAD
         storage_upload(OUT_BUCKET, out_path, out)
 
+        # UPDATE DB
         rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "complete", "output_path": out_path})
         rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "complete"})
 
@@ -252,13 +260,18 @@ def process_once():
             rest_patch("hdr_orders", {"id": f"eq.{order_id}"}, {"status": "complete"})
 
         print("Completed set", set_id)
-
         return True
 
     except Exception as e:
         print("ERROR:", str(e))
-        rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "error", "last_error": str(e)})
-        rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "error"})
+        try:
+            rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "error", "last_error": str(e)})
+        except Exception:
+            pass
+        try:
+            rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "error"})
+        except Exception:
+            pass
         return True
 
 
@@ -271,6 +284,10 @@ def main():
         did = process_once()
         if not did:
             time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
