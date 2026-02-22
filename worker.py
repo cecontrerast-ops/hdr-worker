@@ -146,26 +146,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-----------------------------------------
-DEPLOY (RAILWAY) — SIMPLE STEPS
-----------------------------------------
-1) Create a GitHub repo (example name: hdr-worker)
-2) Add the 3 files above (requirements.txt, Dockerfile, worker.py) and push
-3) Railway → New Project → Deploy from GitHub → select repo
-4) Add env vars in Railway:
-   SUPABASE_URL = https://YOURPROJECT.supabase.co
-   SUPABASE_SERVICE_ROLE_KEY = YOUR_SERVICE_ROLE_KEY
-5) Deploy
-
-----------------------------------------
-TEST
-----------------------------------------
-1) Open Lovable app → /hdr-upload
-2) Upload exactly 3 bracket images
-3) Watch /hdr-order/:id page:
-   queued → processing → complete
-4) Download button should appear when complete.
-
-========================================
-END WORKER PACK
-========================================
