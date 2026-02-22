@@ -160,7 +160,7 @@ def storage_upload(bucket: str, rel_path: str, img_bgr):
 
 
 # =========================
-# ULTRA SAFE HDR FUSION
+# HDR FUSION (FIXED: NO BLACK OUTPUT)
 # =========================
 def exposure_fusion(imgs_bgr):
     try:
@@ -171,13 +171,23 @@ def exposure_fusion(imgs_bgr):
         h, w = imgs_bgr[0].shape[:2]
         imgs = [cv2.resize(img, (w, h)) for img in imgs_bgr]
 
-        # Convert one-by-one to keep memory lower
-        imgs_float = []
-        for img in imgs:
-            imgs_float.append(img.astype(np.float32) / 255.0)
+        # Convert to float 0..1
+        imgs_float = [(img.astype(np.float32) / 255.0) for img in imgs]
 
         mertens = cv2.createMergeMertens()
-        fused = mertens.process(imgs_float)
+        fused = mertens.process(imgs_float)  # float32
+
+        # ✅ Clamp
+        fused = np.clip(fused, 0.0, 1.0)
+
+        # ✅ Normalize brightness so it doesn't come out near-black
+        mx = float(fused.max())
+        if mx > 1e-6:
+            fused = fused / mx
+
+        # ✅ Gamma correction (screen-friendly)
+        gamma = 1.0 / 2.2
+        fused = np.power(fused, gamma)
 
         out = (fused * 255.0).clip(0, 255).astype(np.uint8)
 
@@ -284,10 +294,6 @@ def main():
         did = process_once()
         if not did:
             time.sleep(POLL_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
