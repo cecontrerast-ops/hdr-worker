@@ -1,399 +1,448 @@
 import os
 import time
+import json
+import math
+import traceback
+from datetime import datetime, timezone
+
 import requests
 import numpy as np
 import cv2
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-RAW_BUCKET = "hdr_raw"
-OUT_BUCKET = "hdr_output"
-POLL_SECONDS = 2
+# =========================
+# ENV
+# =========================
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-# Try 2000 if Railway can handle it. If you crash, set back to 1600.
-MAX_DIM = int(os.environ.get("MAX_DIM", "1800"))
+RAW_BUCKET = os.environ.get("RAW_BUCKET", "hdr_raw").strip()
+OUT_BUCKET = os.environ.get("OUT_BUCKET", "hdr_output").strip()
+
+POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "2"))
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
+
+# Quality controls (tune if needed)
+MAX_MERGE_DIM = int(os.environ.get("MAX_MERGE_DIM", "2600"))  # merge at up to ~2600px longest side
+JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "92"))
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("ERROR: Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars.")
+    # We don't exit hard to keep container alive for debugging, but worker won't do anything.
+
+HEADERS = {
+    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    "Content-Type": "application/json",
+}
+
+REST = f"{SUPABASE_URL}/rest/v1"
+STORAGE = f"{SUPABASE_URL}/storage/v1"
 
 
-def headers_json():
-    return {
-        "apikey": SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def headers_storage():
-    return {
-        "apikey": SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SERVICE_ROLE_KEY}",
-    }
-
-
+# =========================
+# HELPERS: TIME/LOG
+# =========================
 def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return datetime.now(timezone.utc).isoformat()
 
 
-def rest_get(table: str, params: dict):
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    r = requests.get(url, headers=headers_json(), params=params, timeout=60)
-    if r.status_code // 100 != 2:
-        raise RuntimeError(f"REST GET {table} failed {r.status_code}: {r.text}")
+def log(msg: str):
+    print(msg, flush=True)
+
+
+# =========================
+# SUPABASE REST HELPERS
+# =========================
+def rest_get(table: str, params: str):
+    url = f"{REST}/{table}?{params}"
+    r = requests.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
     return r.json()
 
 
-def rest_patch(table: str, where_params: dict, payload: dict):
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    r = requests.patch(url, headers=headers_json(), params=where_params, json=payload, timeout=60)
-    if r.status_code // 100 != 2:
-        raise RuntimeError(f"REST PATCH {table} failed {r.status_code}: {r.text}")
+def rest_patch(table: str, match_params: str, payload: dict):
+    url = f"{REST}/{table}?{match_params}"
+    r = requests.patch(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else None
 
 
-def pick_job():
-    rows = rest_get(
-        "hdr_jobs",
-        {
-            "select": "id,set_id,status,attempts,locked_at",
-            "status": "eq.queued",
-            "locked_at": "is.null",
-            "limit": "1",
-        },
-    )
+def rest_post(table: str, payload: dict):
+    url = f"{REST}/{table}"
+    r = requests.post(url, headers=HEADERS, data=json.dumps(payload), timeout=30)
+    r.raise_for_status()
+    return r.json() if r.text else None
+
+
+def patch_row(table: str, row_id: str, payload: dict):
+    # assumes tables use 'id' uuid
+    return rest_patch(table, f"id=eq.{row_id}", payload)
+
+
+def get_one(table: str, row_id: str):
+    rows = rest_get(table, f"id=eq.{row_id}&limit=1")
     return rows[0] if rows else None
 
 
-def get_set(set_id: str):
-    rows = rest_get(
-        "hdr_sets",
-        {
-            "select": "id,order_id,file_under_id,file_base_id,file_over_id,status",
-            "id": f"eq.{set_id}",
-            "limit": "1",
-        },
-    )
-    if not rows:
-        raise RuntimeError("Set not found")
-    return rows[0]
-
-
-def get_file(file_id: str):
-    rows = rest_get(
-        "hdr_files",
-        {
-            "select": "id,storage_path",
-            "id": f"eq.{file_id}",
-            "limit": "1",
-        },
-    )
-    if not rows:
-        raise RuntimeError("File not found")
-    return rows[0]
-
-
-def normalize_storage_path(bucket: str, path: str):
-    path = (path or "").lstrip("/")
-    if path.startswith(f"{bucket}/"):
-        path = path[len(bucket) + 1 :]
-    return path
-
-
-def downscale_max(img, max_dim: int):
-    h, w = img.shape[:2]
-    m = max(h, w)
-    if m <= max_dim:
-        return img
-    scale = max_dim / m
-    return cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-
-
-def storage_download(bucket: str, rel_path: str):
-    rel_path = normalize_storage_path(bucket, rel_path)
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{rel_path}"
-    print("Downloading:", f"{bucket}/{rel_path}")
-
-    r = requests.get(url, headers=headers_storage(), timeout=180)
-    if r.status_code != 200:
-        raise RuntimeError(f"Download failed {r.status_code}: {r.text}")
-
-    buf = np.frombuffer(r.content, dtype=np.uint8)
-    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+# =========================
+# STORAGE HELPERS
+# =========================
+def storage_download(bucket: str, path: str) -> np.ndarray:
+    # downloads bytes, decodes jpg/png with OpenCV
+    url = f"{STORAGE}/object/{bucket}/{path}"
+    r = requests.get(url, headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "apikey": SUPABASE_SERVICE_ROLE_KEY}, timeout=60)
+    r.raise_for_status()
+    data = np.frombuffer(r.content, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
-        raise RuntimeError("Image decode failed")
+        raise RuntimeError(f"Failed to decode image: {bucket}/{path}")
+    return img
 
-    return downscale_max(img, MAX_DIM)
 
-
-def storage_upload(bucket: str, rel_path: str, img_bgr):
-    ok, enc = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
+def storage_upload_jpg(bucket: str, path: str, img_bgr: np.ndarray):
+    # encode JPG
+    ok, buf = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)])
     if not ok:
-        raise RuntimeError("Encode failed")
-
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{rel_path}"
-    print("Uploading:", f"{bucket}/{rel_path}")
-
+        raise RuntimeError("Failed to encode JPG")
+    url = f"{STORAGE}/object/{bucket}/{path}"
     r = requests.post(
         url,
         headers={
-            **headers_storage(),
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
             "Content-Type": "image/jpeg",
-            "x-upsert": "true",
         },
-        data=enc.tobytes(),
-        timeout=180,
+        data=buf.tobytes(),
+        timeout=120,
     )
-
-    if r.status_code // 100 != 2:
-        raise RuntimeError(f"Upload failed {r.status_code}: {r.text}")
-
-
-# -------------------------
-# Vertical correction (more accurate)
-# -------------------------
-def estimate_vertical_rotation_deg(img_bgr):
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 60, 160)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=90, minLineLength=140, maxLineGap=10)
-    if lines is None:
-        return 0.0
-
-    angles = []
-    for x1, y1, x2, y2 in lines[:, 0]:
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx == 0 and dy == 0:
-            continue
-        ang = np.degrees(np.arctan2(dy, dx))
-        v = abs(abs(ang) - 90)
-        if v < 8:  # closer to vertical only
-            rotate = 90 - ang
-            while rotate > 180:
-                rotate -= 360
-            while rotate < -180:
-                rotate += 360
-            if abs(rotate) <= 8:
-                angles.append(rotate)
-
-    if not angles:
-        return 0.0
-    return float(np.median(angles))
+    # If object exists, Supabase Storage returns 409; in that case do PUT
+    if r.status_code == 409:
+        r = requests.put(
+            url,
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Content-Type": "image/jpeg",
+            },
+            data=buf.tobytes(),
+            timeout=120,
+        )
+    r.raise_for_status()
 
 
-def rotate_image(img_bgr, deg):
-    if abs(deg) < 0.1:
-        return img_bgr
-    h, w = img_bgr.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), deg, 1.0)
-    return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+# =========================
+# IMAGE PIPELINE (AUTOHDR-LIKE)
+# =========================
+def resize_to_max(img: np.ndarray, max_dim: int):
+    h, w = img.shape[:2]
+    m = max(h, w)
+    if m <= max_dim:
+        return img, 1.0
+    scale = max_dim / float(m)
+    new_w = max(1, int(w * scale))
+    new_h = max(1, int(h * scale))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
 
 
-# -------------------------
-# HDR merge
-# -------------------------
-def merge_mertens(under, base, over):
-    h, w = base.shape[:2]
-    under = cv2.resize(under, (w, h))
-    over = cv2.resize(over, (w, h))
+def align_ecc(base_bgr: np.ndarray, target_bgr: np.ndarray):
+    """
+    Align target to base using ECC (translation+rotation).
+    This helps ghosting and improves window detail.
+    """
+    base = cv2.cvtColor(base_bgr, cv2.COLOR_BGR2GRAY)
+    tgt = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2GRAY)
 
-    imgs = [under, base, over]
-    imgs_f = [i.astype(np.float32) / 255.0 for i in imgs]
+    # Downscale for speed
+    base_s, s1 = resize_to_max(base, 1400)
+    tgt_s, s2 = resize_to_max(tgt, 1400)
 
-    mertens = cv2.createMergeMertens()
-    fused = mertens.process(imgs_f)
-    fused = np.clip(fused, 0.0, 1.0)
+    # Keep same size
+    h, w = base_s.shape[:2]
+    tgt_s = cv2.resize(tgt_s, (w, h), interpolation=cv2.INTER_AREA)
 
-    mx = float(fused.max())
-    if mx > 1e-6:
-        fused = fused / mx
+    # Motion model: Euclidean (rotation + translation)
+    warp = np.eye(2, 3, dtype=np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-6)
 
-    # More natural than previous: less washout
-    fused = np.power(fused, 1.0 / 2.15)
+    try:
+        cc, warp = cv2.findTransformECC(base_s, tgt_s, warp, cv2.MOTION_EUCLIDEAN, criteria)
+    except Exception:
+        # Fallback: no alignment
+        return target_bgr
 
-    out = (fused * 255.0).clip(0, 255).astype(np.uint8)
+    # Apply warp at full res
+    H, W = base_bgr.shape[:2]
+    aligned = cv2.warpAffine(
+        target_bgr,
+        warp,
+        (W, H),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return aligned
+
+
+def merge_mertens(imgs_bgr: list[np.ndarray]) -> np.ndarray:
+    """
+    Exposure fusion (natural) – base layer.
+    """
+    m = cv2.createMergeMertens(contrast_weight=1.0, saturation_weight=0.6, exposure_weight=0.8)
+    imgs_f = [img.astype(np.float32) / 255.0 for img in imgs_bgr]
+    fused = m.process(imgs_f)
+    out = np.clip(fused * 255.0, 0, 255).astype(np.uint8)
     return out
 
 
-# -------------------------
-# Window mask (smarter)
-# -------------------------
-def window_mask(fused_bgr):
-    # detect likely windows: bright + low texture + usually upper half
-    gray = cv2.cvtColor(fused_bgr, cv2.COLOR_BGR2GRAY)
-
-    h, w = gray.shape[:2]
-    upper = gray[: int(h * 0.75), :]
-
-    # bright threshold
-    m = (upper > 215).astype(np.uint8) * 255
-
-    # remove small noise, keep window regions
-    kernel = np.ones((9, 9), np.uint8)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=2)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
-
-    # put back into full mask
-    full = np.zeros_like(gray, dtype=np.uint8)
-    full[: int(h * 0.75), :] = m
-
-    # feather edges
-    full = cv2.GaussianBlur(full, (0, 0), 5.0)
-    return full
-
-
-def window_pull_blend(fused_bgr, under_bgr):
-    m = window_mask(fused_bgr).astype(np.float32) / 255.0
-    if m.mean() < 0.01:
-        return fused_bgr
-
-    alpha = (m[..., None] * 0.88)  # stronger window pull than before, still feathered
-    out = fused_bgr.astype(np.float32) * (1 - alpha) + under_bgr.astype(np.float32) * alpha
+def gray_world_wb(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Simple white balance: gray-world. Keeps walls neutral.
+    """
+    img = img_bgr.astype(np.float32)
+    b, g, r = cv2.split(img)
+    mb, mg, mr = np.mean(b), np.mean(g), np.mean(r)
+    m = (mb + mg + mr) / 3.0
+    b = b * (m / (mb + 1e-6))
+    g = g * (m / (mg + 1e-6))
+    r = r * (m / (mr + 1e-6))
+    out = cv2.merge([b, g, r])
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# -------------------------
-# Tone + clean (avoid washout)
-# -------------------------
-def highlight_compress(img_bgr):
-    # compress only highlights to avoid washed-out look
+def highlight_rolloff(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Soft highlight compression to avoid washed/veiled whites.
+    """
+    x = img_bgr.astype(np.float32) / 255.0
+    # Reinhard-like compression
+    y = x / (x + 0.35)
+    out = np.clip(y * 255.0, 0, 255).astype(np.uint8)
+    return out
+
+
+def local_contrast(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    CLAHE on L channel for crispness (AutoHDR-like).
+    """
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    Lf = L.astype(np.float32) / 255.0
-
-    # soft knee: pulls back near-white
-    knee = 0.78
-    out = np.where(Lf < knee, Lf, knee + (Lf - knee) * 0.55)
-
-    L2 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
-    lab2 = cv2.merge((L2, a, b))
-    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    L, A, B = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    L2 = clahe.apply(L)
+    lab2 = cv2.merge([L2, A, B])
+    out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    return out
 
 
-def clean_bright_airy(img_bgr):
-    # modest lift (less than before)
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    Lf = L.astype(np.float32)
-
-    p95 = np.percentile(Lf, 95)
-    if p95 > 1:
-        scale = 238.0 / p95  # slightly lower to prevent washout
-        Lf = np.clip(Lf * scale, 0, 255)
-
-    # gentle shadow lift only
-    Lf = np.power(Lf / 255.0, 0.96) * 255.0
-
-    L2 = np.clip(Lf, 0, 255).astype(np.uint8)
-    lab2 = cv2.merge((L2, a, b))
-    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+def s_curve(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Gentle contrast curve (prevents flat HDR look).
+    """
+    x = img_bgr.astype(np.float32) / 255.0
+    # mild S-curve
+    y = 1 / (1 + np.exp(-8 * (x - 0.5)))
+    # blend curve with original to keep natural
+    y = 0.55 * x + 0.45 * y
+    out = np.clip(y * 255.0, 0, 255).astype(np.uint8)
+    return out
 
 
-def neutral_wb(img_bgr):
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    a = cv2.add(a, int((128 - np.mean(a)) * 0.25))
-    b = cv2.add(b, int((128 - np.mean(b)) * 0.25))
-    return cv2.cvtColor(cv2.merge((L, a, b)), cv2.COLOR_LAB2BGR)
+def window_mask_blend(fused_bgr: np.ndarray, under_bgr: np.ndarray) -> np.ndarray:
+    """
+    Heuristic window pull:
+    - Find very bright low-sat areas (blown windows)
+    - Blend in underexposed image only in those regions
+    """
+    hsv = cv2.cvtColor(fused_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # mask blown highlights: high V + low S
+    mask = ((v > 220) & (s < 70)).astype(np.uint8) * 255
+
+    # Expand and soften the mask
+    mask = cv2.medianBlur(mask, 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=6, sigmaY=6)
+
+    # Convert to float alpha
+    alpha = (mask.astype(np.float32) / 255.0)[..., None]
+    alpha = np.clip(alpha * 1.25, 0, 1)  # stronger pull
+
+    fused_f = fused_bgr.astype(np.float32)
+    under_f = under_bgr.astype(np.float32)
+
+    out = fused_f * (1 - alpha) + under_f * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
-def clarity_microcontrast(img_bgr):
-    # local contrast without HDR crunch
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    blur = cv2.GaussianBlur(L, (0, 0), 2.0)
-    L2 = cv2.addWeighted(L, 1.20, blur, -0.20, 0)
-    return cv2.cvtColor(cv2.merge((L2, a, b)), cv2.COLOR_LAB2BGR)
+def edge_aware_sharpen(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Sharpen without halos.
+    """
+    # Unsharp mask
+    blur = cv2.GaussianBlur(img_bgr, (0, 0), sigmaX=1.1, sigmaY=1.1)
+    sharp = cv2.addWeighted(img_bgr, 1.35, blur, -0.35, 0)
 
-
-def edge_aware_sharpen(img_bgr):
-    # bilateral keeps edges clean, then unsharp
-    smooth = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=40, sigmaSpace=40)
-    blur = cv2.GaussianBlur(smooth, (0, 0), 1.0)
-    sharp = cv2.addWeighted(smooth, 1.55, blur, -0.55, 0)
+    # light detail enhance (keeps it premium)
+    sharp = cv2.detailEnhance(sharp, sigma_s=10, sigma_r=0.15)
     return sharp
 
 
-def process_once():
-    print("Worker alive: checking for jobs...")
+def autohdr_like_pipeline(under_bgr: np.ndarray, base_bgr: np.ndarray, over_bgr: np.ndarray) -> np.ndarray:
+    """
+    Full "AutoHDR-like" pipeline.
+    """
+    # Ensure same size (some phones/cameras may differ by 1px)
+    H, W = base_bgr.shape[:2]
+    under_bgr = cv2.resize(under_bgr, (W, H), interpolation=cv2.INTER_AREA)
+    over_bgr = cv2.resize(over_bgr, (W, H), interpolation=cv2.INTER_AREA)
 
-    job = pick_job()
+    # Align under/over to base
+    under_a = align_ecc(base_bgr, under_bgr)
+    over_a = align_ecc(base_bgr, over_bgr)
+
+    # Merge on scaled version (speed/memory), but keep a path to better sharpness:
+    base_s, scale = resize_to_max(base_bgr, MAX_MERGE_DIM)
+    under_s = cv2.resize(under_a, (base_s.shape[1], base_s.shape[0]), interpolation=cv2.INTER_AREA)
+    over_s = cv2.resize(over_a, (base_s.shape[1], base_s.shape[0]), interpolation=cv2.INTER_AREA)
+
+    fused_s = merge_mertens([under_s, base_s, over_s])
+
+    # Post-processing on merged image
+    fused_s = gray_world_wb(fused_s)
+    fused_s = highlight_rolloff(fused_s)
+    fused_s = local_contrast(fused_s)
+    fused_s = s_curve(fused_s)
+
+    # Window pull (blend under exposure into window areas)
+    fused_s = window_mask_blend(fused_s, under_s)
+
+    # Upscale back to full size
+    fused = cv2.resize(fused_s, (W, H), interpolation=cv2.INTER_CUBIC)
+
+    # Final crispness (apply at full res)
+    fused = edge_aware_sharpen(fused)
+
+    return fused
+
+
+# =========================
+# JOB LOGIC
+# =========================
+def fetch_next_job():
+    # queued jobs with no locked_at
+    # NOTE: This assumes your schema: hdr_jobs: id, set_id, status, attempts, locked_at
+    rows = rest_get("hdr_jobs", "status=eq.queued&locked_at=is.null&order=created_at.asc&limit=1")
+    return rows[0] if rows else None
+
+
+def order_done(order_id: str):
+    sets = rest_get("hdr_sets", f"order_id=eq.{order_id}&limit=200")
+    # done when all are complete
+    for s in sets:
+        if s.get("status") not in ("complete",):
+            return False
+    return True
+
+
+def process_once():
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        log("Worker alive but missing SUPABASE env vars.")
+        return False
+
+    job = fetch_next_job()
     if not job:
+        log("Worker alive: checking for jobs...")
         return False
 
     job_id = job["id"]
     set_id = job["set_id"]
-    attempts = job.get("attempts", 0)
-    print(f"Picked job {job_id} set_id={set_id} attempts={attempts}")
+    attempts = int(job.get("attempts") or 0)
+
+    log(f"Picked job {job_id} set_id={set_id} attempts={attempts}")
+
+    # Lock job
+    patch_row("hdr_jobs", job_id, {
+        "status": "processing",
+        "locked_at": now_iso(),
+        "attempts": attempts + 1
+    })
 
     try:
-        rest_patch(
-            "hdr_jobs",
-            {"id": f"eq.{job_id}"},
-            {"status": "processing", "locked_at": now_iso(), "attempts": attempts + 1},
-        )
+        s = get_one("hdr_sets", set_id)
+        if not s:
+            raise RuntimeError(f"hdr_sets not found: {set_id}")
 
-        s = get_set(set_id)
         order_id = s["order_id"]
+        patch_row("hdr_sets", set_id, {"status": "processing"})
+        patch_row("hdr_orders", order_id, {"status": "processing"})
 
-        rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "processing"})
-        rest_patch("hdr_orders", {"id": f"eq.{order_id}"}, {"status": "processing"})
+        # Get file rows
+        f_under = get_one("hdr_files", s["file_under_id"])
+        f_base = get_one("hdr_files", s["file_base_id"])
+        f_over = get_one("hdr_files", s["file_over_id"])
 
-        f_under = get_file(s["file_under_id"])
-        f_base = get_file(s["file_base_id"])
-        f_over = get_file(s["file_over_id"])
+        if not f_under or not f_base or not f_over:
+            raise RuntimeError("Missing hdr_files rows for set")
 
-        print("Paths:", f_under["storage_path"], f_base["storage_path"], f_over["storage_path"])
+        p_under = f_under["storage_path"]
+        p_base = f_base["storage_path"]
+        p_over = f_over["storage_path"]
 
-        under = storage_download(RAW_BUCKET, f_under["storage_path"])
-        base = storage_download(RAW_BUCKET, f_base["storage_path"])
-        over = storage_download(RAW_BUCKET, f_over["storage_path"])
+        log(f"Paths: {p_under} {p_base} {p_over}")
 
-        # Auto-straighten based on base exposure
-        deg = estimate_vertical_rotation_deg(base)
-        if abs(deg) >= 0.1:
-            print("Auto-straighten deg:", deg)
-            under = rotate_image(under, deg)
-            base = rotate_image(base, deg)
-            over = rotate_image(over, deg)
+        log(f"Downloading: {RAW_BUCKET}/{p_under}")
+        img_under = storage_download(RAW_BUCKET, p_under)
+        log(f"Downloading: {RAW_BUCKET}/{p_base}")
+        img_base = storage_download(RAW_BUCKET, p_base)
+        log(f"Downloading: {RAW_BUCKET}/{p_over}")
+        img_over = storage_download(RAW_BUCKET, p_over)
 
-        fused = merge_mertens(under, base, over)
-
-        # Window pull (stronger + better mask)
-        fused = window_pull_blend(fused, under)
-
-        # Premium toning order:
-        fused = clean_bright_airy(fused)
-        fused = highlight_compress(fused)
-        fused = neutral_wb(fused)
-        fused = clarity_microcontrast(fused)
-        fused = edge_aware_sharpen(fused)
+        # Main pipeline
+        out = autohdr_like_pipeline(img_under, img_base, img_over)
 
         out_path = f"{order_id}/{set_id}.jpg"
-        storage_upload(OUT_BUCKET, out_path, fused)
+        log(f"Uploading: {OUT_BUCKET}/{out_path}")
+        storage_upload_jpg(OUT_BUCKET, out_path, out)
 
-        rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "complete", "output_path": out_path})
-        rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "complete"})
+        patch_row("hdr_sets", set_id, {"status": "complete", "output_path": out_path})
+        patch_row("hdr_jobs", job_id, {"status": "complete", "last_error": None})
 
-        sets = rest_get("hdr_sets", {"select": "status", "order_id": f"eq.{order_id}"})
-        if sets and all(x["status"] == "complete" for x in sets):
-            rest_patch("hdr_orders", {"id": f"eq.{order_id}"}, {"status": "complete"})
+        if order_done(order_id):
+            patch_row("hdr_orders", order_id, {"status": "complete"})
 
-        print("Completed set", set_id)
+        log(f"Completed set {set_id}")
         return True
 
     except Exception as e:
-        print("ERROR:", str(e))
+        err = f"{type(e).__name__}: {str(e)}"
+        log("ERROR processing job:\n" + err)
+        log(traceback.format_exc())
+
+        # Mark job error (or requeue if attempts remain)
         try:
-            rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "error", "last_error": str(e)})
+            if attempts + 1 >= MAX_ATTEMPTS:
+                patch_row("hdr_jobs", job_id, {"status": "error", "last_error": err})
+                try:
+                    patch_row("hdr_sets", set_id, {"status": "error"})
+                except Exception:
+                    pass
+            else:
+                # unlock + requeue
+                patch_row("hdr_jobs", job_id, {"status": "queued", "locked_at": None, "last_error": err})
+                try:
+                    patch_row("hdr_sets", set_id, {"status": "queued"})
+                except Exception:
+                    pass
         except Exception:
             pass
-        try:
-            rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "error"})
-        except Exception:
-            pass
+
         return True
 
 
 def main():
-    print("HDR Worker started.")
+    log("HDR Worker started.")
     while True:
         did = process_once()
         if not did:
