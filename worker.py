@@ -11,9 +11,8 @@ RAW_BUCKET = "hdr_raw"
 OUT_BUCKET = "hdr_output"
 POLL_SECONDS = 2
 
-# Keep this conservative for Railway stability.
-# If you upgrade Railway memory later, set this to 2200–2600.
-MAX_DIM = int(os.environ.get("MAX_DIM", "1600"))
+# Try 2000 if Railway can handle it. If you crash, set back to 1600.
+MAX_DIM = int(os.environ.get("MAX_DIM", "1800"))
 
 
 def headers_json():
@@ -125,7 +124,7 @@ def storage_download(bucket: str, rel_path: str):
 
 
 def storage_upload(bucket: str, rel_path: str, img_bgr):
-    ok, enc = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    ok, enc = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 93])
     if not ok:
         raise RuntimeError("Encode failed")
 
@@ -142,108 +141,18 @@ def storage_upload(bucket: str, rel_path: str, img_bgr):
         data=enc.tobytes(),
         timeout=180,
     )
+
     if r.status_code // 100 != 2:
         raise RuntimeError(f"Upload failed {r.status_code}: {r.text}")
 
 
 # -------------------------
-# CLEAN, BRIGHT HDR MERGE
+# Vertical correction (more accurate)
 # -------------------------
-def merge_mertens_clean(under, base, over):
-    # Same size
-    h, w = base.shape[:2]
-    under = cv2.resize(under, (w, h))
-    over = cv2.resize(over, (w, h))
-
-    imgs = [under, base, over]
-    imgs_f = [i.astype(np.float32) / 255.0 for i in imgs]
-
-    mertens = cv2.createMergeMertens()
-    fused = mertens.process(imgs_f)
-    fused = np.clip(fused, 0.0, 1.0)
-
-    # Prevent “black” output: normalize to a real display range
-    mx = float(fused.max())
-    if mx > 1e-6:
-        fused = fused / mx
-
-    # Bright/airy look: lift midtones slightly
-    fused = np.power(fused, 1.0 / 2.0)  # lighter than 2.2 gamma
-
-    out = (fused * 255.0).clip(0, 255).astype(np.uint8)
-    return out
-
-
-def tonal_clean_bright(img_bgr):
-    """
-    Luxury clean toning:
-    - raise exposure using percentile scaling
-    - lift shadows lightly
-    - protect highlights
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-
-    Lf = L.astype(np.float32)
-
-    # Scale so 98th percentile maps near 245 (bright but not blown)
-    p98 = np.percentile(Lf, 98)
-    if p98 > 1:
-        scale = 245.0 / p98
-        Lf = np.clip(Lf * scale, 0, 255)
-
-    # Gentle shadow lift: curve
-    # y = x^(0.92) makes darks brighter without nuking highlights
-    Lf = np.power(Lf / 255.0, 0.92) * 255.0
-
-    L = np.clip(Lf, 0, 255).astype(np.uint8)
-    lab2 = cv2.merge((L, a, b))
-    out = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-    return out
-
-
-def neutral_wb(img_bgr):
-    """
-    Mild gray-world (very conservative): prevents orange/blue casts,
-    but avoids turning interiors “sterile”.
-    """
-    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    L, a, b = cv2.split(lab)
-    a = cv2.add(a, int((128 - np.mean(a)) * 0.35))
-    b = cv2.add(b, int((128 - np.mean(b)) * 0.35))
-    lab2 = cv2.merge((L, a, b))
-    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-
-
-def window_pull_blend(fused_bgr, under_bgr):
-    """
-    Subtle window recovery (no sticker look):
-    blend underexposed only where fused highlights are too hot.
-    """
-    gray = cv2.cvtColor(fused_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    mask = (gray > 220).astype(np.float32)  # window-ish highlights
-    mask = cv2.GaussianBlur(mask, (0, 0), 3.0)
-    mask = np.clip(mask, 0.0, 1.0)
-
-    alpha = (mask[..., None] * 0.70)  # subtle
-    out = fused_bgr.astype(np.float32) * (1 - alpha) + under_bgr.astype(np.float32) * alpha
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def crisp_sharpen(img_bgr):
-    """
-    Real estate sharp:
-    unsharp mask tuned for downscaled images (looks “pro” not crunchy).
-    """
-    blur = cv2.GaussianBlur(img_bgr, (0, 0), 1.2)
-    out = cv2.addWeighted(img_bgr, 1.35, blur, -0.35, 0)
-    return out
-
-
 def estimate_vertical_rotation_deg(img_bgr):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 60, 160)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=90, minLineLength=90, maxLineGap=10)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=90, minLineLength=140, maxLineGap=10)
     if lines is None:
         return 0.0
 
@@ -255,13 +164,13 @@ def estimate_vertical_rotation_deg(img_bgr):
             continue
         ang = np.degrees(np.arctan2(dy, dx))
         v = abs(abs(ang) - 90)
-        if v < 10:
+        if v < 8:  # closer to vertical only
             rotate = 90 - ang
             while rotate > 180:
                 rotate -= 360
             while rotate < -180:
                 rotate += 360
-            if abs(rotate) <= 6:  # keep gentle
+            if abs(rotate) <= 8:
                 angles.append(rotate)
 
     if not angles:
@@ -275,6 +184,131 @@ def rotate_image(img_bgr, deg):
     h, w = img_bgr.shape[:2]
     M = cv2.getRotationMatrix2D((w / 2, h / 2), deg, 1.0)
     return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+
+# -------------------------
+# HDR merge
+# -------------------------
+def merge_mertens(under, base, over):
+    h, w = base.shape[:2]
+    under = cv2.resize(under, (w, h))
+    over = cv2.resize(over, (w, h))
+
+    imgs = [under, base, over]
+    imgs_f = [i.astype(np.float32) / 255.0 for i in imgs]
+
+    mertens = cv2.createMergeMertens()
+    fused = mertens.process(imgs_f)
+    fused = np.clip(fused, 0.0, 1.0)
+
+    mx = float(fused.max())
+    if mx > 1e-6:
+        fused = fused / mx
+
+    # More natural than previous: less washout
+    fused = np.power(fused, 1.0 / 2.15)
+
+    out = (fused * 255.0).clip(0, 255).astype(np.uint8)
+    return out
+
+
+# -------------------------
+# Window mask (smarter)
+# -------------------------
+def window_mask(fused_bgr):
+    # detect likely windows: bright + low texture + usually upper half
+    gray = cv2.cvtColor(fused_bgr, cv2.COLOR_BGR2GRAY)
+
+    h, w = gray.shape[:2]
+    upper = gray[: int(h * 0.75), :]
+
+    # bright threshold
+    m = (upper > 215).astype(np.uint8) * 255
+
+    # remove small noise, keep window regions
+    kernel = np.ones((9, 9), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=2)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # put back into full mask
+    full = np.zeros_like(gray, dtype=np.uint8)
+    full[: int(h * 0.75), :] = m
+
+    # feather edges
+    full = cv2.GaussianBlur(full, (0, 0), 5.0)
+    return full
+
+
+def window_pull_blend(fused_bgr, under_bgr):
+    m = window_mask(fused_bgr).astype(np.float32) / 255.0
+    if m.mean() < 0.01:
+        return fused_bgr
+
+    alpha = (m[..., None] * 0.88)  # stronger window pull than before, still feathered
+    out = fused_bgr.astype(np.float32) * (1 - alpha) + under_bgr.astype(np.float32) * alpha
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+# -------------------------
+# Tone + clean (avoid washout)
+# -------------------------
+def highlight_compress(img_bgr):
+    # compress only highlights to avoid washed-out look
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    Lf = L.astype(np.float32) / 255.0
+
+    # soft knee: pulls back near-white
+    knee = 0.78
+    out = np.where(Lf < knee, Lf, knee + (Lf - knee) * 0.55)
+
+    L2 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    lab2 = cv2.merge((L2, a, b))
+    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+
+def clean_bright_airy(img_bgr):
+    # modest lift (less than before)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    Lf = L.astype(np.float32)
+
+    p95 = np.percentile(Lf, 95)
+    if p95 > 1:
+        scale = 238.0 / p95  # slightly lower to prevent washout
+        Lf = np.clip(Lf * scale, 0, 255)
+
+    # gentle shadow lift only
+    Lf = np.power(Lf / 255.0, 0.96) * 255.0
+
+    L2 = np.clip(Lf, 0, 255).astype(np.uint8)
+    lab2 = cv2.merge((L2, a, b))
+    return cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+
+
+def neutral_wb(img_bgr):
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    a = cv2.add(a, int((128 - np.mean(a)) * 0.25))
+    b = cv2.add(b, int((128 - np.mean(b)) * 0.25))
+    return cv2.cvtColor(cv2.merge((L, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def clarity_microcontrast(img_bgr):
+    # local contrast without HDR crunch
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    blur = cv2.GaussianBlur(L, (0, 0), 2.0)
+    L2 = cv2.addWeighted(L, 1.20, blur, -0.20, 0)
+    return cv2.cvtColor(cv2.merge((L2, a, b)), cv2.COLOR_LAB2BGR)
+
+
+def edge_aware_sharpen(img_bgr):
+    # bilateral keeps edges clean, then unsharp
+    smooth = cv2.bilateralFilter(img_bgr, d=7, sigmaColor=40, sigmaSpace=40)
+    blur = cv2.GaussianBlur(smooth, (0, 0), 1.0)
+    sharp = cv2.addWeighted(smooth, 1.55, blur, -0.55, 0)
+    return sharp
 
 
 def process_once():
@@ -312,7 +346,7 @@ def process_once():
         base = storage_download(RAW_BUCKET, f_base["storage_path"])
         over = storage_download(RAW_BUCKET, f_over["storage_path"])
 
-        # Auto-straighten (gentle)
+        # Auto-straighten based on base exposure
         deg = estimate_vertical_rotation_deg(base)
         if abs(deg) >= 0.1:
             print("Auto-straighten deg:", deg)
@@ -320,16 +354,17 @@ def process_once():
             base = rotate_image(base, deg)
             over = rotate_image(over, deg)
 
-        # Merge
-        fused = merge_mertens_clean(under, base, over)
+        fused = merge_mertens(under, base, over)
 
-        # Window pull (subtle)
+        # Window pull (stronger + better mask)
         fused = window_pull_blend(fused, under)
 
-        # Clean tone (bright/airy) + mild WB + crisp sharpen
-        fused = tonal_clean_bright(fused)
+        # Premium toning order:
+        fused = clean_bright_airy(fused)
+        fused = highlight_compress(fused)
         fused = neutral_wb(fused)
-        fused = crisp_sharpen(fused)
+        fused = clarity_microcontrast(fused)
+        fused = edge_aware_sharpen(fused)
 
         out_path = f"{order_id}/{set_id}.jpg"
         storage_upload(OUT_BUCKET, out_path, fused)
@@ -337,7 +372,6 @@ def process_once():
         rest_patch("hdr_sets", {"id": f"eq.{set_id}"}, {"status": "complete", "output_path": out_path})
         rest_patch("hdr_jobs", {"id": f"eq.{job_id}"}, {"status": "complete"})
 
-        # Mark order complete if all sets complete
         sets = rest_get("hdr_sets", {"select": "status", "order_id": f"eq.{order_id}"})
         if sets and all(x["status"] == "complete" for x in sets):
             rest_patch("hdr_orders", {"id": f"eq.{order_id}"}, {"status": "complete"})
